@@ -1,0 +1,5 @@
+discord.py
+flask
+yt-dlp
+PyNaCl
+davey
