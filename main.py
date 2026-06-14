@@ -84,9 +84,9 @@ def _ydl_base() -> dict:
     return opts
 
 def buscar_info(busca: str) -> dict:
-    """Busca informações sem baixar."""
+    """Busca informações sem baixar — sem especificar formato."""
     opts = _ydl_base()
-    opts['format'] = 'bestaudio/best'
+    # Não define 'format' aqui para não rejeitar o vídeo antes do download
 
     if any(x in busca for x in ('youtube.com', 'youtu.be')):
         query = busca
@@ -118,7 +118,8 @@ def baixar_audio(webpage_url: str, video_id: str) -> str:
 
     opts = _ydl_base()
     opts.update({
-        'format': 'bestaudio/best',
+        # Aceita qualquer formato com áudio — o FFmpeg converte pra mp3
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best[acodec!=none]/best',
         'outtmpl': caminho,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -126,6 +127,9 @@ def baixar_audio(webpage_url: str, video_id: str) -> str:
             'preferredquality': '128',
         }],
         'ffmpeg_location': os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()),
+        # Ignora erros de formato e tenta o próximo disponível
+        'ignoreerrors': False,
+        'retries': 3,
     })
 
     with yt_dlp.YoutubeDL(opts) as ydl:
