@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-from discord.ui import Button, View
+from discord.ui import View
 from flask import Flask
 from threading import Thread
 import yt_dlp
@@ -9,249 +9,465 @@ import os
 from collections import deque
 
 # ========== CONFIGURAÇÕES ==========
-TOKEN = os.getenv("TOKEN")
-if TOKEN is None:
-    TOKEN = ""
+TOKEN = os.getenv("TOKEN", "")
 PREFIXO = "!"
 
-# ========== SERVIDOR WEB ==========
+# ─── Caminho do cookies.txt ───────────────────────────────────────────────────
+# Coloque o cookies.txt na raiz do projeto (junto com main.py)
+COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
+if not os.path.exists(COOKIES_PATH):
+    print(f"⚠️  AVISO: cookies.txt não encontrado em {COOKIES_PATH}")
+    COOKIES_PATH = None
+
+# ========== SERVIDOR WEB (UptimeRobot / Render) ==========
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot online!"
 
-def run():
-    app.run(host='0.0.0.0', port=8080)
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
-Thread(target=run).start()
+Thread(target=run_web, daemon=True).start()
 
 # ========== BOT ==========
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-
 bot = commands.Bot(command_prefix=PREFIXO, intents=intents)
 
-# ========== VARIÁVEIS ==========
-fila_de_musicas = deque()
-musica_atual = None
-modo_loop = False
-volume_do_bot = 0.5
+# ========== ESTADO POR SERVIDOR ==========
+# Cada guild_id tem seu próprio estado para suportar múltiplos servidores
+class EstadoServidor:
+    def __init__(self):
+        self.fila: deque = deque()
+        self.musica_atual: dict | None = None
+        self.modo_loop: bool = False
+        self.volume: float = 0.5
 
-# ========== YT-DLP COM COOKIES ==========
-YDL_OPTS = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
-    'no_warnings': True,
-    'cookiefile': 'cookies.txt',
+_estados: dict[int, EstadoServidor] = {}
+
+def estado(guild_id: int) -> EstadoServidor:
+    if guild_id not in _estados:
+        _estados[guild_id] = EstadoServidor()
+    return _estados[guild_id]
+
+# ========== YT-DLP ==========
+def _ydl_opts(extra: dict = {}) -> dict:
+    """Monta as opções do yt-dlp sempre com cookies se disponível."""
+    base = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'source_address': '0.0.0.0',
+        'force_ipv4': True,
+        'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            )
+        },
+    }
+    # ✅ CORREÇÃO PRINCIPAL: passa o cookies.txt para o yt-dlp
+    if COOKIES_PATH:
+        base['cookiefile'] = COOKIES_PATH
+
+    base.update(extra)
+    return base
+
+FFMPEG_OPTIONS = {
+    'before_options': (
+        '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
+        '-reconnect_on_network_error 1'
+    ),
+    'options': '-vn -bufsize 64k',
 }
 
-def buscar_musica(busca, usar_youtube=False):
-    if 'spotify.com' in busca:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-            info = ydl.extract_info(busca, download=False)
-            artista = info.get('artist', '')
-            titulo = info.get('title', '')
-            busca = f"{artista} {titulo}"
-    if usar_youtube or 'youtube.com' in busca or 'youtu.be' in busca:
-        if not busca.startswith('http'): busca = f"ytsearch:{busca}"
-        usar_youtube = True
-    else:
-        if not busca.startswith('http'): busca = f"scsearch:{busca}"
-    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-        info = ydl.extract_info(busca, download=False)
-        if 'entries' in info and len(info['entries']) > 0: info = info['entries'][0]
+def _extrair_info(query: str) -> dict:
+    """Extrai informações de áudio. Levanta exceção se não encontrar."""
+    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            info = info['entries'][0]
+
+        # Pega a URL do stream de áudio
+        url_audio = None
+        formatos = info.get('formats', [])
+        for f in reversed(formatos):
+            if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                url_audio = f.get('url')
+                break
+        if not url_audio:
+            url_audio = info.get('url', '')
+
         return {
-            'url': info.get('url', ''),
+            'url': url_audio,
+            'webpage_url': info.get('webpage_url', ''),
             'titulo': info.get('title', 'Desconhecido'),
             'artista': info.get('uploader', 'Desconhecido'),
             'thumb': info.get('thumbnail', ''),
-            'fonte': 'YouTube' if usar_youtube else 'SoundCloud',
+            'duracao': int(info.get('duration') or 0),
+            'fonte': 'YouTube' if 'youtube' in info.get('extractor', '') else info.get('extractor', '?').title(),
         }
 
-async def tocar_fila(vc):
-    global musica_atual, modo_loop
-    if not vc or not vc.is_connected(): return
-    if modo_loop and musica_atual:
-        try:
-            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(musica_atual['url'], before_options="-reconnect 1 -reconnect_streamed 1"), volume=volume_do_bot)
-            vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(tocar_fila(vc), bot.loop))
-        except: musica_atual = None; asyncio.run_coroutine_threadsafe(tocar_fila(vc), bot.loop)
+def buscar_musica(busca: str) -> dict:
+    """Resolve a busca do usuário para informações de áudio."""
+    # Link direto do YouTube ou SoundCloud
+    if any(x in busca for x in ('youtube.com', 'youtu.be', 'soundcloud.com')):
+        return _extrair_info(busca)
+
+    # Busca por texto — tenta YouTube primeiro
+    try:
+        return _extrair_info(f"ytsearch1:{busca}")
+    except Exception:
+        pass
+
+    # Fallback: SoundCloud
+    try:
+        return _extrair_info(f"scsearch1:{busca}")
+    except Exception:
+        raise Exception("Não encontrei a música em nenhuma plataforma.")
+
+# ========== PLAYER ==========
+async def tocar_proximo(vc: discord.VoiceClient, guild_id: int):
+    """Toca a próxima música da fila (ou repete em modo loop)."""
+    e = estado(guild_id)
+
+    if not vc or not vc.is_connected():
         return
-    while fila_de_musicas:
-        info = fila_de_musicas.popleft()
-        if not info.get('url'): continue
-        try:
-            musica_atual = info
-            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(info['url'], before_options="-reconnect 1 -reconnect_streamed 1"), volume=volume_do_bot)
-            vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(tocar_fila(vc), bot.loop))
-            return
-        except: musica_atual = None; continue
-    musica_atual = None
 
+    # Modo loop: repete a música atual
+    if e.modo_loop and e.musica_atual:
+        info = e.musica_atual
+    elif e.fila:
+        info = e.fila.popleft()
+        e.musica_atual = info
+    else:
+        e.musica_atual = None
+        return
+
+    try:
+        source = discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(info['url'], **FFMPEG_OPTIONS),
+            volume=e.volume
+        )
+        vc.play(
+            source,
+            after=lambda err: asyncio.run_coroutine_threadsafe(
+                tocar_proximo(vc, guild_id), bot.loop
+            )
+        )
+    except Exception as ex:
+        print(f"[ERRO ao tocar] {ex}")
+        e.musica_atual = None
+        # Tenta a próxima mesmo em caso de erro
+        asyncio.run_coroutine_threadsafe(tocar_proximo(vc, guild_id), bot.loop)
+
+# ========== PAINEL DE BOTÕES ==========
 class Painel(View):
-    def __init__(self): super().__init__(timeout=None)
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
     @discord.ui.button(label="⏯️", style=discord.ButtonStyle.green)
-    async def b_pause(self, i, b):
-        vc = i.guild.voice_client
-        if vc and vc.is_playing(): vc.pause(); await i.response.send_message("⏸️ Pausado", ephemeral=True)
-        elif vc and vc.is_paused(): vc.resume(); await i.response.send_message("▶️ Tocando", ephemeral=True)
-        else: await i.response.send_message("❌ Nada", ephemeral=True)
+    async def b_pause(self, interaction: discord.Interaction, button):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸️ Pausado", ephemeral=True)
+        elif vc and vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ Retomado", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Nada tocando.", ephemeral=True)
+
     @discord.ui.button(label="⏭️", style=discord.ButtonStyle.gray)
-    async def b_skip(self, i, b):
-        vc = i.guild.voice_client
-        if vc and vc.is_playing(): vc.stop(); await i.response.send_message("⏭️ Pulando", ephemeral=True)
-        else: await i.response.send_message("❌ Nada", ephemeral=True)
+    async def b_skip(self, interaction: discord.Interaction, button):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await interaction.response.send_message("⏭️ Pulando...", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Nada tocando.", ephemeral=True)
+
     @discord.ui.button(label="🔁", style=discord.ButtonStyle.blurple)
-    async def b_loop(self, i, b):
-        global modo_loop; modo_loop = not modo_loop
-        await i.response.send_message(f"Loop {'ON' if modo_loop else 'OFF'}", ephemeral=True)
+    async def b_loop(self, interaction: discord.Interaction, button):
+        e = estado(self.guild_id)
+        e.modo_loop = not e.modo_loop
+        await interaction.response.send_message(
+            f"🔁 Loop {'**ativado**' if e.modo_loop else '**desativado**'}",
+            ephemeral=True
+        )
+
     @discord.ui.button(label="🛑", style=discord.ButtonStyle.red)
-    async def b_stop(self, i, b):
-        global fila_de_musicas, modo_loop
-        vc = i.guild.voice_client
-        if vc: fila_de_musicas.clear(); modo_loop = False; vc.stop(); await vc.disconnect(); await i.response.send_message("🛑 Parou", ephemeral=True)
-        else: await i.response.send_message("❌ Nada", ephemeral=True)
+    async def b_stop(self, interaction: discord.Interaction, button):
+        e = estado(self.guild_id)
+        e.fila.clear()
+        e.modo_loop = False
+        e.musica_atual = None
+        vc = interaction.guild.voice_client
+        if vc:
+            vc.stop()
+            await vc.disconnect()
+        await interaction.response.send_message("⏹️ Parado e saí do canal.", ephemeral=True)
 
-@bot.command()
-async def painel(ctx):
-    embed = discord.Embed(title="🎵 Painel", color=0xFF0000 if musica_atual and musica_atual.get('fonte')=='YouTube' else 0x8A2BE2)
-    if musica_atual:
-        embed.add_field(name="🎧 Tocando", value=f"**{musica_atual['titulo'][:100]}**", inline=False)
-        if musica_atual['thumb']: embed.set_thumbnail(url=musica_atual['thumb'])
-    if fila_de_musicas:
-        txt = "".join(f"`{i}.` {m['titulo'][:40]}\n" for i,m in enumerate(fila_de_musicas,1))
+# ========== HELPERS ==========
+def formatar_duracao(segundos: int) -> str:
+    m, s = divmod(segundos, 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m}min" if h else f"{m}:{s:02d}"
+
+def embed_musica(info: dict, titulo_embed="🎧 Tocando agora") -> discord.Embed:
+    embed = discord.Embed(
+        title=titulo_embed,
+        description=f"**{info['titulo'][:100]}**",
+        color=0xFF0000
+    )
+    if info.get('thumb'):
+        embed.set_thumbnail(url=info['thumb'])
+    embed.add_field(name="👤 Artista", value=info['artista'][:50], inline=True)
+    embed.add_field(name="🌐 Fonte", value=info.get('fonte', '?'), inline=True)
+    if info.get('duracao', 0) > 0:
+        embed.add_field(name="⏱️ Duração", value=formatar_duracao(info['duracao']), inline=True)
+    return embed
+
+async def conectar_vc(ctx) -> discord.VoiceClient | None:
+    """Garante conexão com o canal de voz do usuário."""
+    if not ctx.author.voice:
+        await ctx.send("❌ Entre num canal de voz primeiro!")
+        return None
+    canal = ctx.author.voice.channel
+    vc = ctx.voice_client
+    if vc is None:
+        vc = await canal.connect()
+    elif vc.channel != canal:
+        await vc.move_to(canal)
+    return vc
+
+# ========== COMANDOS ==========
+
+@bot.command(name="yt", aliases=["play", "tocar"])
+async def cmd_yt(ctx, *, busca: str = None):
+    """!yt <nome ou link> — busca e toca uma música"""
+    if not busca:
+        await ctx.send("❌ Use: `!yt nome da música ou link`")
+        return
+
+    vc = await conectar_vc(ctx)
+    if not vc:
+        return
+
+    msg = await ctx.send(f"🔎 Buscando: `{busca}`...")
+
+    try:
+        info = await asyncio.to_thread(buscar_musica, busca)
+    except Exception as ex:
+        await msg.edit(content=f"❌ Erro: {str(ex)[:120]}")
+        return
+
+    if not info.get('url'):
+        await msg.edit(content="❌ Não consegui obter o áudio.")
+        return
+
+    e = estado(ctx.guild.id)
+
+    if vc.is_playing() or vc.is_paused():
+        e.fila.append(info)
+        await msg.edit(
+            content=None,
+            embed=discord.Embed(
+                title="📋 Adicionado à fila",
+                description=f"**{info['titulo'][:100]}**\nPosição: #{len(e.fila)}",
+                color=0x5865F2
+            )
+        )
+    else:
+        e.musica_atual = info
+        try:
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(info['url'], **FFMPEG_OPTIONS),
+                volume=e.volume
+            )
+            vc.play(
+                source,
+                after=lambda err: asyncio.run_coroutine_threadsafe(
+                    tocar_proximo(vc, ctx.guild.id), bot.loop
+                )
+            )
+            await msg.edit(content=None, embed=embed_musica(info))
+        except Exception as ex:
+            await msg.edit(content=f"❌ Erro ao reproduzir: {str(ex)[:100]}")
+            e.musica_atual = None
+
+@bot.command(name="skip", aliases=["pular"])
+async def cmd_skip(ctx):
+    """!skip — pula a música atual"""
+    vc = ctx.voice_client
+    if vc and (vc.is_playing() or vc.is_paused()):
+        vc.stop()
+        await ctx.send("⏭️ Pulando...")
+    else:
+        await ctx.send("❌ Nada tocando.")
+
+@bot.command(name="pause", aliases=["pausar"])
+async def cmd_pause(ctx):
+    """!pause — pausa"""
+    vc = ctx.voice_client
+    if vc and vc.is_playing():
+        vc.pause()
+        await ctx.send("⏸️ Pausado.")
+    else:
+        await ctx.send("❌ Nada tocando.")
+
+@bot.command(name="continuar", aliases=["resume"])
+async def cmd_continuar(ctx):
+    """!continuar — retoma"""
+    vc = ctx.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await ctx.send("▶️ Retomado.")
+    else:
+        await ctx.send("❌ Não está pausado.")
+
+@bot.command(name="loop")
+async def cmd_loop(ctx):
+    """!loop — ativa/desativa repetição"""
+    e = estado(ctx.guild.id)
+    e.modo_loop = not e.modo_loop
+    await ctx.send(f"🔁 Loop {'**ativado**' if e.modo_loop else '**desativado**'}")
+
+@bot.command(name="volume", aliases=["vol"])
+async def cmd_volume(ctx, vol: int = None):
+    """!volume [0-100] — ajusta o volume"""
+    e = estado(ctx.guild.id)
+    if vol is None:
+        await ctx.send(f"🔊 Volume atual: **{int(e.volume * 100)}%**")
+        return
+    if not 0 <= vol <= 100:
+        await ctx.send("❌ Use um valor entre 0 e 100.")
+        return
+    e.volume = vol / 100
+    vc = ctx.voice_client
+    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = e.volume
+    await ctx.send(f"🔊 Volume: **{vol}%**")
+
+@bot.command(name="fila", aliases=["queue", "q"])
+async def cmd_fila(ctx):
+    """!fila — mostra a fila de músicas"""
+    e = estado(ctx.guild.id)
+    if not e.fila and not e.musica_atual:
+        await ctx.send("📋 A fila está vazia.")
+        return
+    linhas = []
+    if e.musica_atual:
+        linhas.append(f"**▶️ Tocando:** {e.musica_atual['titulo'][:60]}")
+    for i, m in enumerate(e.fila, 1):
+        linhas.append(f"`{i}.` {m['titulo'][:55]}")
+    await ctx.send("\n".join(linhas)[:2000])
+
+@bot.command(name="remover", aliases=["remove", "rm"])
+async def cmd_remover(ctx, posicao: int = None):
+    """!remover <n> — remove da fila pela posição"""
+    e = estado(ctx.guild.id)
+    if posicao is None or posicao < 1 or posicao > len(e.fila):
+        await ctx.send(f"❌ Informe uma posição válida (1–{len(e.fila)}).")
+        return
+    lista = list(e.fila)
+    removida = lista.pop(posicao - 1)
+    e.fila = deque(lista)
+    await ctx.send(f"🗑️ Removido: **{removida['titulo'][:60]}**")
+
+@bot.command(name="limpar", aliases=["clear"])
+async def cmd_limpar(ctx):
+    """!limpar — limpa a fila"""
+    e = estado(ctx.guild.id)
+    e.fila.clear()
+    await ctx.send("🧹 Fila limpa!")
+
+@bot.command(name="parar", aliases=["stop"])
+async def cmd_parar(ctx):
+    """!parar — para tudo e sai do canal"""
+    e = estado(ctx.guild.id)
+    e.fila.clear()
+    e.modo_loop = False
+    e.musica_atual = None
+    vc = ctx.voice_client
+    if vc:
+        vc.stop()
+        await vc.disconnect()
+    await ctx.send("⏹️ Parado.")
+
+@bot.command(name="tocando", aliases=["np", "nowplaying"])
+async def cmd_tocando(ctx):
+    """!tocando — mostra a música atual"""
+    e = estado(ctx.guild.id)
+    if e.musica_atual:
+        await ctx.send(embed=embed_musica(e.musica_atual))
+    else:
+        await ctx.send("❌ Nada tocando agora.")
+
+@bot.command(name="painel")
+async def cmd_painel(ctx):
+    """!painel — painel interativo"""
+    e = estado(ctx.guild.id)
+    embed = discord.Embed(title="🎵 Painel de Controle", color=0xFF0000)
+    if e.musica_atual:
+        embed.add_field(name="🎧 Tocando", value=e.musica_atual['titulo'][:100], inline=False)
+    else:
+        embed.add_field(name="🎧 Tocando", value="Nada", inline=False)
+    if e.fila:
+        txt = "\n".join(f"`{i}.` {m['titulo'][:45]}" for i, m in enumerate(e.fila, 1))
         embed.add_field(name="📋 Fila", value=txt[:1024], inline=False)
-    embed.add_field(name="🔁", value="ON" if modo_loop else "OFF")
-    embed.add_field(name="🔊", value=f"{int(volume_do_bot*100)}%")
-    await ctx.send(embed=embed, view=Painel())
+    embed.add_field(name="🔁 Loop", value="ON" if e.modo_loop else "OFF", inline=True)
+    embed.add_field(name="🔊 Volume", value=f"{int(e.volume * 100)}%", inline=True)
+    await ctx.send(embed=embed, view=Painel(ctx.guild.id))
 
-@bot.command()
-async def play(ctx, *, busca=None):
-    if busca is None: await ctx.send("❌ Use: `!play nome`"); return
-    if not ctx.author.voice: await ctx.send("❌ Entre num canal de voz!"); return
-    canal = ctx.author.voice.channel
-    if ctx.voice_client is None: vc = await canal.connect()
-    else: vc = ctx.voice_client; await vc.move_to(canal) if vc.channel != canal else None
-    await ctx.send(f"🔎 Procurando: `{busca}`...")
-    info = None
-    for yt in [False, True]:
-        try:
-            info = await asyncio.to_thread(buscar_musica, busca, yt)
-            if info and info.get('url'): break
-        except: continue
-    if not info or not info.get('url'): await ctx.send("❌ Não encontrei."); return
-    if vc.is_playing() or vc.is_paused():
-        fila_de_musicas.append(info)
-        await ctx.send(f"📋 **{info['titulo'][:80]}** adicionada!")
-    else:
-        global musica_atual; musica_atual = info
-        try:
-            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(info['url'], before_options="-reconnect 1 -reconnect_streamed 1"), volume=volume_do_bot)
-            vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(tocar_fila(vc), bot.loop))
-            embed = discord.Embed(title="🎧 Tocando agora", description=f"**{info['titulo'][:100]}**", color=0xFF0000 if info.get('fonte')=='YouTube' else 0xFF5500)
-            if info['thumb']: embed.set_thumbnail(url=info['thumb'])
-            embed.add_field(name="👤", value=info['artista'][:50]); embed.add_field(name="🌐", value=info.get('fonte','?'))
-            await ctx.send(embed=embed)
-        except: await ctx.send("❌ Erro ao tocar."); musica_atual = None
-
-@bot.command()
-async def yt(ctx, *, busca=None):
-    if busca is None: await ctx.send("❌ Use: `!yt nome`"); return
-    if not ctx.author.voice: await ctx.send("❌ Entre num canal de voz!"); return
-    canal = ctx.author.voice.channel
-    if ctx.voice_client is None: vc = await canal.connect()
-    else: vc = ctx.voice_client; await vc.move_to(canal) if vc.channel != canal else None
-    await ctx.send(f"🔎 YouTube: `{busca}`...")
-    try: info = await asyncio.to_thread(buscar_musica, busca, True)
-    except Exception as e: await ctx.send(f"❌ Erro: {str(e)[:100]}"); return
-    if not info or not info.get('url'): await ctx.send("❌ Não encontrei."); return
-    if vc.is_playing() or vc.is_paused():
-        fila_de_musicas.append(info); await ctx.send(f"📋 **{info['titulo'][:80]}** adicionada!")
-    else:
-        global musica_atual; musica_atual = info
-        try:
-            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(info['url'], before_options="-reconnect 1 -reconnect_streamed 1"), volume=volume_do_bot)
-            vc.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(tocar_fila(vc), bot.loop))
-            embed = discord.Embed(title="🎧 Tocando (YouTube)", description=f"**{info['titulo'][:100]}**", color=0xFF0000)
-            if info['thumb']: embed.set_thumbnail(url=info['thumb'])
-            embed.add_field(name="👤", value=info['artista'][:50]); await ctx.send(embed=embed)
-        except: await ctx.send("❌ Erro ao tocar."); musica_atual = None
-
-@bot.command()
-async def fila(ctx):
-    if not fila_de_musicas: await ctx.send("📋 Fila vazia."); return
-    txt = "**📋 Fila:**\n" + "".join(f"`{i}.` {m['titulo'][:50]}\n" for i,m in enumerate(fila_de_musicas,1))
-    await ctx.send(txt[:2000])
-
-@bot.command()
-async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing(): ctx.voice_client.stop(); await ctx.send("⏭️ Pulando!")
-    else: await ctx.send("❌ Nada tocando.")
-
-@bot.command()
-async def pause(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing(): ctx.voice_client.pause(); await ctx.send("⏸️ Pausado!")
-    else: await ctx.send("❌ Nada tocando.")
-
-@bot.command()
-async def continuar(ctx):
-    if ctx.voice_client and ctx.voice_client.is_paused(): ctx.voice_client.resume(); await ctx.send("▶️ Tocando!")
-    else: await ctx.send("❌ Não está pausado.")
-
-@bot.command()
-async def loop(ctx):
-    global modo_loop; modo_loop = not modo_loop
-    await ctx.send(f"Loop {'ON' if modo_loop else 'OFF'}!")
-
-@bot.command()
-async def volume(ctx, vol: int = None):
-    global volume_do_bot
-    if vol is None: await ctx.send(f"🔊 {int(volume_do_bot*100)}%"); return
-    if vol < 0 or vol > 100: await ctx.send("❌ 0-100"); return
-    volume_do_bot = vol/100
-    if ctx.voice_client and ctx.voice_client.source and isinstance(ctx.voice_client.source, discord.PCMVolumeTransformer):
-        ctx.voice_client.source.volume = volume_do_bot
-    await ctx.send(f"🔊 **{vol}%**")
-
-@bot.command()
-async def limpar(ctx): fila_de_musicas.clear(); await ctx.send("🧹 Fila limpa!")
-
-@bot.command()
-async def parar(ctx):
-    global fila_de_musicas, modo_loop, musica_atual
-    fila_de_musicas.clear(); modo_loop = False; musica_atual = None
-    if ctx.voice_client: ctx.voice_client.stop(); await ctx.voice_client.disconnect(); await ctx.send("⏹️ Até mais!")
-
-@bot.command()
-async def tocando(ctx):
-    if musica_atual:
-        info = musica_atual
-        embed = discord.Embed(title="🎧 Tocando", description=f"**{info['titulo'][:100]}**", color=0xFF0000 if info.get('fonte')=='YouTube' else 0x8A2BE2)
-        if info['thumb']: embed.set_thumbnail(url=info['thumb'])
-        embed.add_field(name="👤", value=info['artista'][:50]); await ctx.send(embed=embed)
-    else: await ctx.send("❌ Nada.")
-
-@bot.command()
-async def remover(ctx, posicao: int = None):
-    global fila_de_musicas
-    if posicao is None or posicao < 1 or posicao > len(fila_de_musicas): await ctx.send("❌ `!remover <n>`"); return
-    lista = list(fila_de_musicas); removida = lista.pop(posicao-1); fila_de_musicas = deque(lista)
-    await ctx.send(f"🗑️ {removida['titulo'][:50]}")
-
-@bot.command()
-async def comandos(ctx):
-    embed = discord.Embed(title="🎵 Comandos do Dante", color=0xFF0000)
-    embed.add_field(name="🎧", value="`!play` `!yt` `!pause` `!continuar` `!skip`", inline=False)
-    embed.add_field(name="📋", value="`!fila` `!remover` `!limpar`", inline=False)
-    embed.add_field(name="⚙️", value="`!painel` `!loop` `!volume` `!parar`", inline=False)
+@bot.command(name="comandos", aliases=["help", "ajuda"])
+async def cmd_comandos(ctx):
+    """!comandos — lista de comandos"""
+    embed = discord.Embed(title="🎵 Comandos do Bot", color=0xFF0000)
+    embed.add_field(
+        name="🎧 Música",
+        value="`!yt <nome/link>` `!pause` `!continuar` `!skip` `!parar` `!tocando`",
+        inline=False
+    )
+    embed.add_field(
+        name="📋 Fila",
+        value="`!fila` `!remover <n>` `!limpar`",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Controles",
+        value="`!painel` `!loop` `!volume <0-100>`",
+        inline=False
+    )
+    embed.set_footer(text="Aliases: !play e !tocar também funcionam como !yt")
     await ctx.send(embed=embed)
 
+# ========== EVENTOS ==========
 @bot.event
 async def on_ready():
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="!comandos | YouTube + SoundCloud"))
-    print(f"✅ Bot online no Render!")
+    await bot.change_presence(
+        activity=discord.Activity(type=discord.ActivityType.listening, name="!yt")
+    )
+    print(f"✅ {bot.user} online!")
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Desconecta automaticamente se ficar sozinho no canal."""
+    if member == bot.user:
+        return
+    vc = member.guild.voice_client
+    if vc and len(vc.channel.members) == 1:
+        e = estado(member.guild.id)
+        e.fila.clear()
+        e.musica_atual = None
+        await vc.disconnect()
+
+# ========== INICIAR ==========
 bot.run(TOKEN)
