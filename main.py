@@ -98,7 +98,7 @@ def _extrair_info(query: str) -> dict:
         url_audio = None
         formatos = info.get('formats', [])
         for f in reversed(formatos):
-            if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+            if f.get('url') and f.get('acodec') != 'none':
                 url_audio = f.get('url')
                 break
         if not url_audio:
