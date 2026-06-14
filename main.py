@@ -57,9 +57,8 @@ def estado(guild_id: int) -> EstadoServidor:
 
 # ========== YT-DLP ==========
 def _ydl_opts(extra: dict = {}) -> dict:
-    """Monta as opções do yt-dlp sempre com cookies se disponível."""
     base = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
