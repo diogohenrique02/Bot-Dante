@@ -3,3 +3,4 @@ flask
 yt-dlp
 PyNaCl
 davey
+imageio-ffmpeg
