@@ -1,5 +1,7 @@
-import imageio_ffmpeg, os
+import imageio_ffmpeg
+import os
 os.environ["PATH"] += os.pathsep + os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+
 import discord
 from discord.ext import commands
 from discord.ui import View
@@ -7,20 +9,22 @@ from flask import Flask
 from threading import Thread
 import yt_dlp
 import asyncio
+import hashlib
 from collections import deque
 
 # ========== CONFIGURAÇÕES ==========
 TOKEN = os.getenv("TOKEN", "")
 PREFIXO = "!"
+TEMP_DIR = "/tmp/dante_audio"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-# ─── Caminho do cookies.txt ───────────────────────────────────────────────────
-# Coloque o cookies.txt na raiz do projeto (junto com main.py)
-COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
+# Caminho do cookies.txt
+COOKIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 if not os.path.exists(COOKIES_PATH):
-    print(f"⚠️  AVISO: cookies.txt não encontrado em {COOKIES_PATH}")
+    print(f"⚠️  cookies.txt não encontrado em {COOKIES_PATH}")
     COOKIES_PATH = None
 
-# ========== SERVIDOR WEB (UptimeRobot / Render) ==========
+# ========== SERVIDOR WEB ==========
 app = Flask(__name__)
 
 @app.route('/')
@@ -37,10 +41,9 @@ Thread(target=run_web, daemon=True).start()
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-bot = commands.Bot(command_prefix=PREFIXO, intents=intents)
+bot = commands.Bot(command_prefix=PREFIXO, intents=intents, help_command=None)
 
 # ========== ESTADO POR SERVIDOR ==========
-# Cada guild_id tem seu próprio estado para suportar múltiplos servidores
 class EstadoServidor:
     def __init__(self):
         self.fila: deque = deque()
@@ -56,12 +59,16 @@ def estado(guild_id: int) -> EstadoServidor:
     return _estados[guild_id]
 
 # ========== YT-DLP ==========
-def _ydl_opts(extra: dict = {}) -> dict:
-    base = {
-        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-        'noplaylist': True,
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn',
+}
+
+def _ydl_base() -> dict:
+    opts = {
         'quiet': True,
         'no_warnings': True,
+        'noplaylist': True,
         'source_address': '0.0.0.0',
         'force_ipv4': True,
         'http_headers': {
@@ -72,75 +79,88 @@ def _ydl_opts(extra: dict = {}) -> dict:
             )
         },
     }
-    # ✅ CORREÇÃO PRINCIPAL: passa o cookies.txt para o yt-dlp
     if COOKIES_PATH:
-        base['cookiefile'] = COOKIES_PATH
+        opts['cookiefile'] = COOKIES_PATH
+    return opts
 
-    base.update(extra)
-    return base
+def buscar_info(busca: str) -> dict:
+    """Busca informações sem baixar."""
+    opts = _ydl_base()
+    opts['format'] = 'bestaudio/best'
 
-FFMPEG_OPTIONS = {
-    'before_options': (
-        '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-        '-reconnect_on_network_error 1'
-    ),
-    'options': '-vn -bufsize 64k',
-}
+    if any(x in busca for x in ('youtube.com', 'youtu.be')):
+        query = busca
+    else:
+        query = f"ytsearch1:{busca}"
 
-def _extrair_info(query: str) -> dict:
-    """Extrai informações de áudio. Levanta exceção se não encontrar."""
-    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=False)
         if 'entries' in info:
             info = info['entries'][0]
-
-        # Pega a URL do stream de áudio
-        url_audio = None
-        formatos = info.get('formats', [])
-        for f in reversed(formatos):
-            if f.get('url') and f.get('acodec') != 'none':
-                url_audio = f.get('url')
-                break
-        if not url_audio:
-            url_audio = info.get('url', '')
-
         return {
-            'url': url_audio,
-            'webpage_url': info.get('webpage_url', ''),
+            'webpage_url': info.get('webpage_url', info.get('url', '')),
             'titulo': info.get('title', 'Desconhecido'),
             'artista': info.get('uploader', 'Desconhecido'),
             'thumb': info.get('thumbnail', ''),
             'duracao': int(info.get('duration') or 0),
-            'fonte': 'YouTube' if 'youtube' in info.get('extractor', '') else info.get('extractor', '?').title(),
+            'id': info.get('id', ''),
         }
 
-def buscar_musica(busca: str) -> dict:
-    """Resolve a busca do usuário para informações de áudio."""
-    # Link direto do YouTube ou SoundCloud
-    if any(x in busca for x in ('youtube.com', 'youtu.be', 'soundcloud.com')):
-        return _extrair_info(busca)
+def baixar_audio(webpage_url: str, video_id: str) -> str:
+    """Baixa o áudio para arquivo .mp3 e retorna o caminho."""
+    nome = hashlib.md5(video_id.encode()).hexdigest()[:12]
+    caminho = os.path.join(TEMP_DIR, nome)
+    caminho_mp3 = caminho + ".mp3"
 
-    # Busca por texto — tenta YouTube primeiro
+    # Já tem no cache
+    if os.path.exists(caminho_mp3) and os.path.getsize(caminho_mp3) > 10000:
+        return caminho_mp3
+
+    opts = _ydl_base()
+    opts.update({
+        'format': 'bestaudio/best',
+        'outtmpl': caminho,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '128',
+        }],
+        'ffmpeg_location': os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()),
+    })
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([webpage_url])
+
+    # yt-dlp pode salvar como .mp3 ou sem extensão
+    if not os.path.exists(caminho_mp3):
+        for f in os.listdir(TEMP_DIR):
+            if f.startswith(nome):
+                os.rename(os.path.join(TEMP_DIR, f), caminho_mp3)
+                break
+
+    return caminho_mp3
+
+def limpar_cache():
+    """Remove arquivos mais antigos se o cache passar de 500MB."""
     try:
-        return _extrair_info(f"ytsearch1:{busca}")
-    except Exception:
+        arquivos = [
+            (os.path.join(TEMP_DIR, f), os.path.getmtime(os.path.join(TEMP_DIR, f)))
+            for f in os.listdir(TEMP_DIR)
+        ]
+        total = sum(os.path.getsize(a) for a, _ in arquivos)
+        if total > 500 * 1024 * 1024:  # 500MB
+            arquivos.sort(key=lambda x: x[1])
+            for caminho, _ in arquivos[:len(arquivos)//2]:
+                os.remove(caminho)
+    except:
         pass
-
-    # Fallback: SoundCloud
-    try:
-        return _extrair_info(f"scsearch1:{busca}")
-    except Exception:
-        raise Exception("Não encontrei a música em nenhuma plataforma.")
 
 # ========== PLAYER ==========
 async def tocar_proximo(vc: discord.VoiceClient, guild_id: int):
-    """Toca a próxima música da fila (ou repete em modo loop)."""
     e = estado(guild_id)
-
     if not vc or not vc.is_connected():
         return
 
-    # Modo loop: repete a música atual
     if e.modo_loop and e.musica_atual:
         info = e.musica_atual
     elif e.fila:
@@ -151,8 +171,12 @@ async def tocar_proximo(vc: discord.VoiceClient, guild_id: int):
         return
 
     try:
+        caminho = info.get('caminho_audio')
+        if not caminho or not os.path.exists(caminho):
+            return
+
         source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(info['url'], **FFMPEG_OPTIONS),
+            discord.FFmpegPCMAudio(caminho),
             volume=e.volume
         )
         vc.play(
@@ -164,10 +188,9 @@ async def tocar_proximo(vc: discord.VoiceClient, guild_id: int):
     except Exception as ex:
         print(f"[ERRO ao tocar] {ex}")
         e.musica_atual = None
-        # Tenta a próxima mesmo em caso de erro
         asyncio.run_coroutine_threadsafe(tocar_proximo(vc, guild_id), bot.loop)
 
-# ========== PAINEL DE BOTÕES ==========
+# ========== PAINEL ==========
 class Painel(View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=None)
@@ -213,30 +236,28 @@ class Painel(View):
         if vc:
             vc.stop()
             await vc.disconnect()
-        await interaction.response.send_message("⏹️ Parado e saí do canal.", ephemeral=True)
+        await interaction.response.send_message("⏹️ Parado.", ephemeral=True)
 
 # ========== HELPERS ==========
-def formatar_duracao(segundos: int) -> str:
-    m, s = divmod(segundos, 60)
+def formatar_duracao(seg: int) -> str:
+    m, s = divmod(seg, 60)
     h, m = divmod(m, 60)
     return f"{h}h {m}min" if h else f"{m}:{s:02d}"
 
-def embed_musica(info: dict, titulo_embed="🎧 Tocando agora") -> discord.Embed:
+def embed_musica(info: dict, titulo="🎧 Tocando agora") -> discord.Embed:
     embed = discord.Embed(
-        title=titulo_embed,
+        title=titulo,
         description=f"**{info['titulo'][:100]}**",
         color=0xFF0000
     )
     if info.get('thumb'):
         embed.set_thumbnail(url=info['thumb'])
     embed.add_field(name="👤 Artista", value=info['artista'][:50], inline=True)
-    embed.add_field(name="🌐 Fonte", value=info.get('fonte', '?'), inline=True)
     if info.get('duracao', 0) > 0:
         embed.add_field(name="⏱️ Duração", value=formatar_duracao(info['duracao']), inline=True)
     return embed
 
 async def conectar_vc(ctx) -> discord.VoiceClient | None:
-    """Garante conexão com o canal de voz do usuário."""
     if not ctx.author.voice:
         await ctx.send("❌ Entre num canal de voz primeiro!")
         return None
@@ -252,7 +273,6 @@ async def conectar_vc(ctx) -> discord.VoiceClient | None:
 
 @bot.command(name="yt", aliases=["play", "tocar"])
 async def cmd_yt(ctx, *, busca: str = None):
-    """!yt <nome ou link> — busca e toca uma música"""
     if not busca:
         await ctx.send("❌ Use: `!yt nome da música ou link`")
         return
@@ -264,13 +284,19 @@ async def cmd_yt(ctx, *, busca: str = None):
     msg = await ctx.send(f"🔎 Buscando: `{busca}`...")
 
     try:
-        info = await asyncio.to_thread(buscar_musica, busca)
+        info = await asyncio.to_thread(buscar_info, busca)
     except Exception as ex:
-        await msg.edit(content=f"❌ Erro: {str(ex)[:120]}")
+        await msg.edit(content=f"❌ Não encontrei: {str(ex)[:100]}")
         return
 
-    if not info.get('url'):
-        await msg.edit(content="❌ Não consegui obter o áudio.")
+    await msg.edit(content=f"⏳ Baixando áudio de **{info['titulo'][:60]}**...")
+
+    try:
+        caminho = await asyncio.to_thread(baixar_audio, info['webpage_url'], info['id'])
+        info['caminho_audio'] = caminho
+        limpar_cache()
+    except Exception as ex:
+        await msg.edit(content=f"❌ Erro ao baixar: {str(ex)[:100]}")
         return
 
     e = estado(ctx.guild.id)
@@ -289,7 +315,7 @@ async def cmd_yt(ctx, *, busca: str = None):
         e.musica_atual = info
         try:
             source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(info['url'], **FFMPEG_OPTIONS),
+                discord.FFmpegPCMAudio(caminho),
                 volume=e.volume
             )
             vc.play(
@@ -305,7 +331,6 @@ async def cmd_yt(ctx, *, busca: str = None):
 
 @bot.command(name="skip", aliases=["pular"])
 async def cmd_skip(ctx):
-    """!skip — pula a música atual"""
     vc = ctx.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
@@ -315,7 +340,6 @@ async def cmd_skip(ctx):
 
 @bot.command(name="pause", aliases=["pausar"])
 async def cmd_pause(ctx):
-    """!pause — pausa"""
     vc = ctx.voice_client
     if vc and vc.is_playing():
         vc.pause()
@@ -325,7 +349,6 @@ async def cmd_pause(ctx):
 
 @bot.command(name="continuar", aliases=["resume"])
 async def cmd_continuar(ctx):
-    """!continuar — retoma"""
     vc = ctx.voice_client
     if vc and vc.is_paused():
         vc.resume()
@@ -335,20 +358,18 @@ async def cmd_continuar(ctx):
 
 @bot.command(name="loop")
 async def cmd_loop(ctx):
-    """!loop — ativa/desativa repetição"""
     e = estado(ctx.guild.id)
     e.modo_loop = not e.modo_loop
     await ctx.send(f"🔁 Loop {'**ativado**' if e.modo_loop else '**desativado**'}")
 
 @bot.command(name="volume", aliases=["vol"])
 async def cmd_volume(ctx, vol: int = None):
-    """!volume [0-100] — ajusta o volume"""
     e = estado(ctx.guild.id)
     if vol is None:
-        await ctx.send(f"🔊 Volume atual: **{int(e.volume * 100)}%**")
+        await ctx.send(f"🔊 Volume: **{int(e.volume * 100)}%**")
         return
     if not 0 <= vol <= 100:
-        await ctx.send("❌ Use um valor entre 0 e 100.")
+        await ctx.send("❌ Use 0–100.")
         return
     e.volume = vol / 100
     vc = ctx.voice_client
@@ -358,10 +379,9 @@ async def cmd_volume(ctx, vol: int = None):
 
 @bot.command(name="fila", aliases=["queue", "q"])
 async def cmd_fila(ctx):
-    """!fila — mostra a fila de músicas"""
     e = estado(ctx.guild.id)
     if not e.fila and not e.musica_atual:
-        await ctx.send("📋 A fila está vazia.")
+        await ctx.send("📋 Fila vazia.")
         return
     linhas = []
     if e.musica_atual:
@@ -372,10 +392,9 @@ async def cmd_fila(ctx):
 
 @bot.command(name="remover", aliases=["remove", "rm"])
 async def cmd_remover(ctx, posicao: int = None):
-    """!remover <n> — remove da fila pela posição"""
     e = estado(ctx.guild.id)
     if posicao is None or posicao < 1 or posicao > len(e.fila):
-        await ctx.send(f"❌ Informe uma posição válida (1–{len(e.fila)}).")
+        await ctx.send(f"❌ Posição válida: 1–{len(e.fila)}")
         return
     lista = list(e.fila)
     removida = lista.pop(posicao - 1)
@@ -384,14 +403,11 @@ async def cmd_remover(ctx, posicao: int = None):
 
 @bot.command(name="limpar", aliases=["clear"])
 async def cmd_limpar(ctx):
-    """!limpar — limpa a fila"""
-    e = estado(ctx.guild.id)
-    e.fila.clear()
+    estado(ctx.guild.id).fila.clear()
     await ctx.send("🧹 Fila limpa!")
 
 @bot.command(name="parar", aliases=["stop"])
 async def cmd_parar(ctx):
-    """!parar — para tudo e sai do canal"""
     e = estado(ctx.guild.id)
     e.fila.clear()
     e.modo_loop = False
@@ -404,22 +420,21 @@ async def cmd_parar(ctx):
 
 @bot.command(name="tocando", aliases=["np", "nowplaying"])
 async def cmd_tocando(ctx):
-    """!tocando — mostra a música atual"""
     e = estado(ctx.guild.id)
     if e.musica_atual:
         await ctx.send(embed=embed_musica(e.musica_atual))
     else:
-        await ctx.send("❌ Nada tocando agora.")
+        await ctx.send("❌ Nada tocando.")
 
 @bot.command(name="painel")
 async def cmd_painel(ctx):
-    """!painel — painel interativo"""
     e = estado(ctx.guild.id)
     embed = discord.Embed(title="🎵 Painel de Controle", color=0xFF0000)
-    if e.musica_atual:
-        embed.add_field(name="🎧 Tocando", value=e.musica_atual['titulo'][:100], inline=False)
-    else:
-        embed.add_field(name="🎧 Tocando", value="Nada", inline=False)
+    embed.add_field(
+        name="🎧 Tocando",
+        value=e.musica_atual['titulo'][:100] if e.musica_atual else "Nada",
+        inline=False
+    )
     if e.fila:
         txt = "\n".join(f"`{i}.` {m['titulo'][:45]}" for i, m in enumerate(e.fila, 1))
         embed.add_field(name="📋 Fila", value=txt[:1024], inline=False)
@@ -429,7 +444,6 @@ async def cmd_painel(ctx):
 
 @bot.command(name="comandos", aliases=["ajuda"])
 async def cmd_comandos(ctx):
-    """!comandos — lista de comandos"""
     embed = discord.Embed(title="🎵 Comandos do Bot", color=0xFF0000)
     embed.add_field(
         name="🎧 Música",
@@ -446,7 +460,7 @@ async def cmd_comandos(ctx):
         value="`!painel` `!loop` `!volume <0-100>`",
         inline=False
     )
-    embed.set_footer(text="Aliases: !play e !tocar também funcionam como !yt")
+    embed.set_footer(text="!play e !tocar também funcionam como !yt")
     await ctx.send(embed=embed)
 
 # ========== EVENTOS ==========
@@ -459,7 +473,6 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Desconecta automaticamente se ficar sozinho no canal."""
     if member == bot.user:
         return
     vc = member.guild.voice_client
