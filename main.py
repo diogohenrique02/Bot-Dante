@@ -71,11 +71,17 @@ def _ydl_base() -> dict:
         'noplaylist': True,
         'source_address': '0.0.0.0',
         'force_ipv4': True,
+        # Cliente Android nao eh bloqueado por IP como o cliente web
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
         'http_headers': {
             'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
+                'com.google.android.youtube/19.09.37 '
+                '(Linux; U; Android 11) gzip'
             )
         },
     }
