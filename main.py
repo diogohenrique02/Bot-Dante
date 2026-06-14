@@ -10,6 +10,9 @@ from threading import Thread
 import yt_dlp
 import asyncio
 import hashlib
+import urllib.request
+import urllib.parse
+import json
 from collections import deque
 
 # ========== CONFIGURAÇÕES ==========
@@ -18,11 +21,177 @@ PREFIXO = "!"
 TEMP_DIR = "/tmp/dante_audio"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Caminho do cookies.txt
+# Cookies (opcional — melhora acesso a vídeos restritos)
 COOKIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 if not os.path.exists(COOKIES_PATH):
     print(f"⚠️  cookies.txt não encontrado em {COOKIES_PATH}")
     COOKIES_PATH = None
+
+# ========== INVIDIOUS — lista de instâncias públicas como fallback ==========
+# O bot tenta cada instância em ordem até uma funcionar
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.privacydev.net",
+    "https://yt.cdaut.de",
+    "https://invidious.nerdvpn.de",
+    "https://invidious.slipfox.xyz",
+]
+
+def buscar_via_invidious(busca: str) -> dict:
+    """Busca música via API do Invidious (sem bloqueio de IP de datacenter)."""
+    query = urllib.parse.quote(busca)
+    erros = []
+
+    for instancia in INVIDIOUS_INSTANCES:
+        try:
+            url = f"{instancia}/api/v1/search?q={query}&type=video&fields=videoId,title,author,lengthSeconds,videoThumbnails&page=1"
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'application/json',
+            })
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resultados = json.loads(resp.read().decode())
+
+            if not resultados:
+                erros.append(f"{instancia}: sem resultados")
+                continue
+
+            video = resultados[0]
+            video_id = video.get('videoId', '')
+            if not video_id:
+                continue
+
+            # Pega a melhor thumbnail disponível
+            thumbs = video.get('videoThumbnails', [])
+            thumb = thumbs[-1]['url'] if thumbs else ''
+            if thumb and thumb.startswith('/'):
+                thumb = instancia + thumb
+
+            print(f"[Invidious] Encontrado via {instancia}: {video.get('title','?')}")
+            return {
+                'video_id': video_id,
+                'webpage_url': f"https://www.youtube.com/watch?v={video_id}",
+                'titulo': video.get('title', 'Desconhecido'),
+                'artista': video.get('author', 'Desconhecido'),
+                'thumb': thumb,
+                'duracao': int(video.get('lengthSeconds') or 0),
+            }
+        except Exception as ex:
+            erros.append(f"{instancia}: {ex}")
+            continue
+
+    raise Exception(f"Invidious falhou em todas as instâncias: {'; '.join(erros)}")
+
+# ========== YT-DLP ==========
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn',
+}
+
+def _ydl_base() -> dict:
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+        'force_ipv4': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['tv_embedded', 'android', 'web'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            )
+        },
+    }
+    if COOKIES_PATH:
+        opts['cookiefile'] = COOKIES_PATH
+    return opts
+
+def buscar_info(busca: str) -> dict:
+    """
+    Busca a música:
+    1. Se for link do YouTube, usa yt-dlp direto
+    2. Se for busca por texto, usa Invidious (sem bloqueio de IP)
+    """
+    # Link direto — usa yt-dlp
+    if any(x in busca for x in ('youtube.com', 'youtu.be')):
+        opts = _ydl_base()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(busca, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
+            return {
+                'video_id': info.get('id', ''),
+                'webpage_url': info.get('webpage_url', busca),
+                'titulo': info.get('title', 'Desconhecido'),
+                'artista': info.get('uploader', 'Desconhecido'),
+                'thumb': info.get('thumbnail', ''),
+                'duracao': int(info.get('duration') or 0),
+            }
+
+    # Busca por texto — usa Invidious para evitar bloqueio de IP
+    return buscar_via_invidious(busca)
+
+def baixar_audio(webpage_url: str, video_id: str) -> str:
+    """Baixa o áudio para arquivo .mp3 e retorna o caminho."""
+    nome = hashlib.md5(video_id.encode()).hexdigest()[:12]
+    caminho = os.path.join(TEMP_DIR, nome)
+    caminho_mp3 = caminho + ".mp3"
+
+    # Cache — já baixado antes
+    if os.path.exists(caminho_mp3) and os.path.getsize(caminho_mp3) > 10000:
+        print(f"[Cache] Usando arquivo em cache: {caminho_mp3}")
+        return caminho_mp3
+
+    opts = _ydl_base()
+    opts.update({
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best',
+        'outtmpl': caminho,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '128',
+        }],
+        'ffmpeg_location': os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()),
+        'retries': 3,
+    })
+
+    print(f"[Download] Baixando: {webpage_url}")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([webpage_url])
+
+    # yt-dlp pode salvar com extensão diferente — renomeia para .mp3
+    if not os.path.exists(caminho_mp3):
+        for f in os.listdir(TEMP_DIR):
+            if f.startswith(nome) and not f.endswith('.mp3'):
+                os.rename(os.path.join(TEMP_DIR, f), caminho_mp3)
+                break
+
+    if not os.path.exists(caminho_mp3):
+        raise Exception("Arquivo de áudio não foi criado após download.")
+
+    print(f"[Download] Concluído: {caminho_mp3} ({os.path.getsize(caminho_mp3)//1024}KB)")
+    return caminho_mp3
+
+def limpar_cache():
+    """Remove arquivos mais antigos se cache passar de 400MB."""
+    try:
+        arquivos = [
+            (os.path.join(TEMP_DIR, f), os.path.getmtime(os.path.join(TEMP_DIR, f)))
+            for f in os.listdir(TEMP_DIR)
+        ]
+        total = sum(os.path.getsize(a) for a, _ in arquivos)
+        if total > 400 * 1024 * 1024:
+            arquivos.sort(key=lambda x: x[1])
+            for caminho, _ in arquivos[:len(arquivos)//2]:
+                os.remove(caminho)
+    except:
+        pass
 
 # ========== SERVIDOR WEB ==========
 app = Flask(__name__)
@@ -58,128 +227,6 @@ def estado(guild_id: int) -> EstadoServidor:
         _estados[guild_id] = EstadoServidor()
     return _estados[guild_id]
 
-# ========== YT-DLP ==========
-FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
-}
-
-def _ydl_base() -> dict:
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'source_address': '0.0.0.0',
-        'force_ipv4': True,
-        # Clientes alternativos para contornar bloqueio de datacenter
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv_embedded', 'android', 'web'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            )
-        },
-    }
-    if COOKIES_PATH:
-        opts['cookiefile'] = COOKIES_PATH
-    return opts
-
-def buscar_info(busca: str) -> dict:
-    """Busca informações sem baixar."""
-    opts = _ydl_base()
-
-    if any(x in busca for x in ('youtube.com', 'youtu.be')):
-        query = busca
-    else:
-        query = f"ytsearch3:{busca}"  # pede 3 resultados para ter fallback
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-
-        # Se veio lista de resultados, pega o primeiro válido
-        if 'entries' in info:
-            entries = [e for e in info['entries'] if e and e.get('id')]
-            print(f"[DEBUG] busca='{busca}' entries={len(info['entries'])} validos={len(entries)}")
-            if not entries:
-                # Tenta busca direta sem ytsearch como último recurso
-                info2 = ydl.extract_info(f"ytsearch1:{busca}", download=False)
-                entries2 = [e for e in info2.get('entries', []) if e and e.get('id')]
-                if not entries2:
-                    raise Exception("Nenhum resultado encontrado.")
-                info = entries2[0]
-            else:
-                info = entries[0]
-
-        if not info or not info.get('id'):
-            raise Exception("Resultado inválido do YouTube.")
-
-        return {
-            'webpage_url': info.get('webpage_url', info.get('url', '')),
-            'titulo': info.get('title', 'Desconhecido'),
-            'artista': info.get('uploader', 'Desconhecido'),
-            'thumb': info.get('thumbnail', ''),
-            'duracao': int(info.get('duration') or 0),
-            'id': info.get('id', ''),
-        }
-
-def baixar_audio(webpage_url: str, video_id: str) -> str:
-    """Baixa o áudio para arquivo .mp3 e retorna o caminho."""
-    nome = hashlib.md5(video_id.encode()).hexdigest()[:12]
-    caminho = os.path.join(TEMP_DIR, nome)
-    caminho_mp3 = caminho + ".mp3"
-
-    # Já tem no cache
-    if os.path.exists(caminho_mp3) and os.path.getsize(caminho_mp3) > 10000:
-        return caminho_mp3
-
-    opts = _ydl_base()
-    opts.update({
-        # Aceita qualquer formato com áudio — o FFmpeg converte pra mp3
-        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best[acodec!=none]/best',
-        'outtmpl': caminho,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '128',
-        }],
-        'ffmpeg_location': os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()),
-        # Ignora erros de formato e tenta o próximo disponível
-        'ignoreerrors': False,
-        'retries': 3,
-    })
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([webpage_url])
-
-    # yt-dlp pode salvar como .mp3 ou sem extensão
-    if not os.path.exists(caminho_mp3):
-        for f in os.listdir(TEMP_DIR):
-            if f.startswith(nome):
-                os.rename(os.path.join(TEMP_DIR, f), caminho_mp3)
-                break
-
-    return caminho_mp3
-
-def limpar_cache():
-    """Remove arquivos mais antigos se o cache passar de 500MB."""
-    try:
-        arquivos = [
-            (os.path.join(TEMP_DIR, f), os.path.getmtime(os.path.join(TEMP_DIR, f)))
-            for f in os.listdir(TEMP_DIR)
-        ]
-        total = sum(os.path.getsize(a) for a, _ in arquivos)
-        if total > 500 * 1024 * 1024:  # 500MB
-            arquivos.sort(key=lambda x: x[1])
-            for caminho, _ in arquivos[:len(arquivos)//2]:
-                os.remove(caminho)
-    except:
-        pass
-
 # ========== PLAYER ==========
 async def tocar_proximo(vc: discord.VoiceClient, guild_id: int):
     e = estado(guild_id)
@@ -198,6 +245,8 @@ async def tocar_proximo(vc: discord.VoiceClient, guild_id: int):
     try:
         caminho = info.get('caminho_audio')
         if not caminho or not os.path.exists(caminho):
+            print(f"[Player] Arquivo não encontrado: {caminho}")
+            asyncio.run_coroutine_threadsafe(tocar_proximo(vc, guild_id), bot.loop)
             return
 
         source = discord.PCMVolumeTransformer(
@@ -311,17 +360,19 @@ async def cmd_yt(ctx, *, busca: str = None):
     try:
         info = await asyncio.to_thread(buscar_info, busca)
     except Exception as ex:
-        await msg.edit(content=f"❌ Não encontrei: {str(ex)[:100]}")
+        await msg.edit(content=f"❌ Não encontrei: {str(ex)[:120]}")
         return
 
-    await msg.edit(content=f"⏳ Baixando áudio de **{info['titulo'][:60]}**...")
+    await msg.edit(content=f"⏳ Baixando **{info['titulo'][:60]}**...")
 
     try:
-        caminho = await asyncio.to_thread(baixar_audio, info['webpage_url'], info['id'])
+        caminho = await asyncio.to_thread(
+            baixar_audio, info['webpage_url'], info['video_id']
+        )
         info['caminho_audio'] = caminho
         limpar_cache()
     except Exception as ex:
-        await msg.edit(content=f"❌ Erro ao baixar: {str(ex)[:100]}")
+        await msg.edit(content=f"❌ Erro ao baixar: {str(ex)[:120]}")
         return
 
     e = estado(ctx.guild.id)
@@ -494,6 +545,10 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.listening, name="!yt")
     )
+    if COOKIES_PATH:
+        print(f"✅ cookies.txt: {COOKIES_PATH} ({os.path.getsize(COOKIES_PATH)} bytes)")
+    else:
+        print("⚠️  Sem cookies.txt")
     print(f"✅ {bot.user} online!")
 
 @bot.event
