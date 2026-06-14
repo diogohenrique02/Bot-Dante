@@ -90,19 +90,27 @@ def _ydl_base() -> dict:
     return opts
 
 def buscar_info(busca: str) -> dict:
-    """Busca informações sem baixar — sem especificar formato."""
+    """Busca informações sem baixar."""
     opts = _ydl_base()
-    # Não define 'format' aqui para não rejeitar o vídeo antes do download
 
     if any(x in busca for x in ('youtube.com', 'youtu.be')):
         query = busca
     else:
-        query = f"ytsearch1:{busca}"
+        query = f"ytsearch3:{busca}"  # pede 3 resultados para ter fallback
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=False)
+
+        # Se veio lista de resultados, pega o primeiro válido
         if 'entries' in info:
-            info = info['entries'][0]
+            entries = [e for e in info['entries'] if e and e.get('id')]
+            if not entries:
+                raise Exception("Nenhum resultado encontrado.")
+            info = entries[0]
+
+        if not info or not info.get('id'):
+            raise Exception("Resultado inválido do YouTube.")
+
         return {
             'webpage_url': info.get('webpage_url', info.get('url', '')),
             'titulo': info.get('title', 'Desconhecido'),
