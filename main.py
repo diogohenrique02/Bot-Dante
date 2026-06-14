@@ -71,17 +71,17 @@ def _ydl_base() -> dict:
         'noplaylist': True,
         'source_address': '0.0.0.0',
         'force_ipv4': True,
-        # Cliente Android nao eh bloqueado por IP como o cliente web
+        # Clientes alternativos para contornar bloqueio de datacenter
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
-                'player_skip': ['webpage', 'configs'],
+                'player_client': ['tv_embedded', 'android', 'web'],
             }
         },
         'http_headers': {
             'User-Agent': (
-                'com.google.android.youtube/19.09.37 '
-                '(Linux; U; Android 11) gzip'
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
             )
         },
     }
@@ -104,9 +104,16 @@ def buscar_info(busca: str) -> dict:
         # Se veio lista de resultados, pega o primeiro válido
         if 'entries' in info:
             entries = [e for e in info['entries'] if e and e.get('id')]
+            print(f"[DEBUG] busca='{busca}' entries={len(info['entries'])} validos={len(entries)}")
             if not entries:
-                raise Exception("Nenhum resultado encontrado.")
-            info = entries[0]
+                # Tenta busca direta sem ytsearch como último recurso
+                info2 = ydl.extract_info(f"ytsearch1:{busca}", download=False)
+                entries2 = [e for e in info2.get('entries', []) if e and e.get('id')]
+                if not entries2:
+                    raise Exception("Nenhum resultado encontrado.")
+                info = entries2[0]
+            else:
+                info = entries[0]
 
         if not info or not info.get('id'):
             raise Exception("Resultado inválido do YouTube.")
