@@ -428,7 +428,7 @@ async def cmd_painel(ctx):
     embed.add_field(name="🔊 Volume", value=f"{int(e.volume * 100)}%", inline=True)
     await ctx.send(embed=embed, view=Painel(ctx.guild.id))
 
-@bot.command(name="comandos", aliases=["help", "ajuda"])
+@bot.command(name="comandos", aliases=["ajuda"])
 async def cmd_comandos(ctx):
     """!comandos — lista de comandos"""
     embed = discord.Embed(title="🎵 Comandos do Bot", color=0xFF0000)
